@@ -13,6 +13,7 @@ import weakref
 import functools
 import itertools
 from dataclasses import dataclass
+from torch._decomp_tables import decomposition_table, meta_funcs
 
 
 aten = torch.ops.aten
@@ -233,6 +234,11 @@ def check_no_bool_index_tensors(func, self, indices):
 # FakeTensor extends MetaTensors to also carry an additional `fake_device`
 # which tracks devices that would have been used.
 
+def create_contiguous(shape):
+    strides = [1]
+    for dim in reversed(shape[:-1]):
+        strides.append(dim * strides[-1])
+    return list(reversed(strides))
 
 class FakeTensor(torch.Tensor):
     fake_device: torch.device
@@ -260,6 +266,18 @@ class FakeTensor(torch.Tensor):
     # TODO: resolve error in default __repr__
     def __repr__(self):
         return f"FakeTensor({self.fake_device}, {self.size()}, {self.dtype})"
+
+    def numel(self):
+        val = 1
+        for s in self.shape:
+            val = val * s
+        return val
+
+    def stride(self):
+        return create_contiguous(self.shape)
+
+    def new_empty(self, shape):
+        return torch.empty(shape, device='meta')
 
     def new(self, *args, **kwargs):
         # torch.Tensor.new does not go through the normal dispatcher pattern
@@ -299,7 +317,6 @@ class FakeTensor(torch.Tensor):
                     fake_mode = arg.fake_mode
                 else:
                     assert fake_mode is arg.fake_mode, "Mixing modes NYI"
-
         with enable_torch_dispatch_mode(fake_mode):
             return func(*args, **kwargs)
 
@@ -384,6 +401,7 @@ class FakeTensorMode(TorchDispatchMode):
         # the device property
         self.in_kernel_invocation = False
 
+
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs if kwargs else {}
 
@@ -393,7 +411,20 @@ class FakeTensorMode(TorchDispatchMode):
                 return torch.device("meta")
             else:
                 return args[0].fake_device
+        # import pdb; pdb.set_trace()
+        # if func in meta_funcs:
+        #     return meta_funcs[func](*args, **kwargs)
 
+        if func == torch.ops.aten.size.default:
+            return args[0].shape
+        if func == torch.ops.aten.dim.default:
+            return len(args[0].shape)
+        if func == torch.ops.aten.is_contiguous.default:
+            return True
+        if func == torch.ops.aten.stride:
+            return create_contiguous(args[0].shape)
+
+                # return func(*args, **kwargs)
         # prims already wrap FakeTensor inputs to FakeTensor outputs
         # and do device logic, we dont need do anything but run them
         if "prims::" in func._schema.name:
@@ -451,7 +482,12 @@ class FakeTensorMode(TorchDispatchMode):
 
             self.in_kernel_invocation = True
             try:
-                r = func(*args, **kwargs)
+                if func in meta_funcs:
+                    r = meta_funcs[func](*args, **kwargs)
+                elif func in decomposition_table:
+                    r = decomposition_table[func](*args, **kwargs)
+                else:
+                    r = func(*args, **kwargs)
             except NotImplementedError as not_implemented_error:
                 if not self.allow_cpu_fallback:
                     raise not_implemented_error
@@ -468,7 +504,8 @@ class FakeTensorMode(TorchDispatchMode):
 
             common_device = FakeTensor._find_common_device(func, args, kwargs)
 
-            return tree_map(partial(wrap, device=common_device), r)
+            out = tree_map(partial(wrap, device=common_device), r)
+            return out
 
     def from_tensor(self, tensor):
         return self.fake_tensor_converter(self, tensor)
